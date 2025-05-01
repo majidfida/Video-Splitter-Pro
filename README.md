@@ -16,7 +16,7 @@ Video Splitter Pro is a Gradio-based tool for slicing large videos into uniform 
 
 1. Clone this repo.
 2. Place your FFmpeg binaries in `C:\ffmpeg\bin` (Windows) or ensure `ffmpeg` is on your `PATH`.
-3. Run `start.bat` to create a Python venv, install requirements, and launch the app.
+3. Run `install.bat` to create a Python venv, install requirements, and launch the app.
 4. In the browser UI, fill in paths and settings, then hit **Process Videos 🚀**.
 
 ## Usage
