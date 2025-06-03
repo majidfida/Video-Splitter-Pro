@@ -1,145 +1,315 @@
 import os
+import glob
 import subprocess
-import threading
 import gradio as gr
 from datetime import datetime
 import torch
-import ffmpeg
 
-# === Configuration ===
-DEFAULT_FFMPEG_DIR = r"C:\ffmpeg\bin"
+def get_gpu_info():
+    if torch.cuda.is_available():
+        return f"CUDA {torch.version.cuda} - {torch.cuda.get_device_name(0)}"
+    return "No NVIDIA GPU detected"
 
-# Locate FFmpeg: explicit -> PATH -> local bundle
-def find_ffmpeg():
-    exe = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
-    default = os.path.join(DEFAULT_FFMPEG_DIR, exe)
-    if os.path.isfile(default): return default
-    for p in os.environ.get('PATH', '').split(os.pathsep):
-        cand = os.path.join(p, exe)
-        if os.path.isfile(cand): return cand
-    bundled = os.path.join(os.getcwd(), 'ffmpeg', 'bin', exe)
-    if os.path.isfile(bundled): return bundled
-    return None
+def get_duration_with_ffprobe(ffprobe_bin, input_path):
+    """
+    Uses `ffprobe` to return the total duration (in seconds) of input_path as a float.
+    Returns (duration, None) on success, or (None, error_message) on failure.
+    """
+    cmd = [
+        ffprobe_bin,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        input_path
+    ]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return None, (
+            f"Error: `ffprobe` not found at `{ffprobe_bin}`.\n"
+            "Please verify the FFmpeg Folder you provided, or ensure `ffprobe` is on your PATH."
+        )
 
-ffmpeg_path = find_ffmpeg()
-if not ffmpeg_path:
-    raise FileNotFoundError(f"ffmpeg not found. Checked {DEFAULT_FFMPEG_DIR}, PATH, and ./ffmpeg/bin.")
-print(f"Using FFmpeg at: {ffmpeg_path}")
+    if proc.returncode != 0:
+        return None, (
+            f"ffprobe error for `{os.path.basename(input_path)}`:\n"
+            f"{proc.stderr.strip()}"
+        )
 
-stop_event = threading.Event()
+    try:
+        duration = float(proc.stdout.strip())
+    except ValueError:
+        return None, (
+            f"Could not parse duration from ffprobe output:\n{proc.stdout.strip()}"
+        )
+
+    return duration, None
 
 def split_videos(
-    input_folder, output_folder, chunk_duration,
-    use_original, fps, custom_fps, resolution, custom_res, vertical,
-    codec, bitrate, output_format,
-    include_audio, audio_codec, audio_bitrate,
-    crf, use_cuda
+    input_folder,
+    output_folder,
+    chunk_duration,
+    use_original,
+    fps,
+    custom_fps,
+    resolution,
+    custom_res,
+    codec,
+    bitrate,
+    custom_caption,
+    ffmpeg_folder
 ):
-    stop_event.clear()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(output_folder, f"output_{ts}")
-    os.makedirs(out_dir, exist_ok=True)
+    # --------------------------------------------
+    # 1) Determine ffmpeg & ffprobe binaries
+    # --------------------------------------------
+    if ffmpeg_folder and ffmpeg_folder.strip() != "":
+        ffmpeg_bin = os.path.join(ffmpeg_folder, "ffmpeg.exe")
+        ffprobe_bin = os.path.join(ffmpeg_folder, "ffprobe.exe")
+    else:
+        ffmpeg_bin = "ffmpeg"
+        ffprobe_bin = "ffprobe"
 
-    files = [f for f in os.listdir(input_folder) if f.lower().endswith(('.mp4','.mov','.avi','.mkv'))]
-    if not files:
-        return "No video files found."
-
-    for f in files:
-        if stop_event.is_set():
-            return "⚠️ Processing stopped by user."
-        inp = os.path.join(input_folder, f)
-        base = os.path.splitext(f)[0]
-        pat = os.path.join(out_dir, f"{base}_%03d.{output_format}")
-
-        if use_original:
-            probe = ffmpeg.probe(inp)
-            vs = next(s for s in probe['streams'] if s['codec_type']=='video')
-            cur_fps = eval(vs['r_frame_rate'])
-            w, h = vs['width'], vs['height']
-        else:
-            cur_fps = custom_fps if fps=='custom' else float(fps)
-            if resolution=='custom':
-                w,h = map(int, custom_res.split('x'))
-            else:
-                w,h = map(int, resolution.split('x'))
-            if vertical: w,h = h,w
-
-        cmd = [ffmpeg_path]
-        if use_cuda: cmd += ['-hwaccel','cuda']
-        cmd += ['-i', inp]
-
-        # Video codec settings
-        if use_original:
-            cmd += ['-c:v','copy']
-        else:
-            vc_arg = f"{codec}_nvenc" if (use_cuda and codec in ['h264','hevc']) else codec
-            cmd += ['-c:v', vc_arg]
-            if codec in ['h264','hevc','vp9','av1']:
-                cmd += ['-crf', str(crf)]
-            else:
-                cmd += ['-b:v', bitrate]
-            keyint = int(cur_fps * chunk_duration)
-            cmd += ['-g', str(keyint), '-sc_threshold', '0']
-            cmd += ['-r', str(cur_fps), '-s', f'{w}x{h}']
-
-        # Audio settings
-        if include_audio:
-            if use_original:
-                cmd += ['-c:a','copy']
-            else:
-                cmd += ['-c:a', audio_codec, '-b:a', audio_bitrate]
-            cmd += ['-map','0:v','-map','0:a']
-        else:
-            cmd += ['-map','0:v']
-
-        # Segment
-        cmd += ['-f','segment','-segment_time', str(chunk_duration), '-reset_timestamps','1', pat]
-
-        subprocess.run(cmd, check=True)
-
-    return f"✅ Done. Files in {out_dir}"
-
-
-def build_ui():
-    with gr.Blocks() as demo:
-        demo.queue()
-        gr.Markdown("# 🎥 Video Splitter Pro\n_Created by Eagle-42_")
-        gr.Markdown(f"**GPU:** {('CUDA ' + torch.version.cuda if torch.cuda.is_available() else 'No NVIDIA GPU')} ")
-        with gr.Row():
-            inp=gr.Textbox(label="Input Folder")
-            out=gr.Textbox(label="Output Folder")
-        dur=gr.Number(label="Clip Duration (s)", value=3, precision=0)
-        with gr.Accordion("Advanced Settings", open=False):
-            orig=gr.Checkbox(label="Use Original Settings", value=True)
-            fps=gr.Dropdown(["16","18","24","30","60","custom"], label="FPS", value="30")
-            c_fps=gr.Number(label="Custom FPS", visible=False)
-            res=gr.Dropdown(["1280x720","1920x1080","3840x2160","custom"], label="Resolution", value="1920x1080")
-            c_res=gr.Textbox(label="Custom Res (WxH)", visible=False)
-            vert=gr.Checkbox(label="Vertical Orientation", value=False)
-            codec=gr.Dropdown(["h264","hevc","vp9","av1"], label="Video Codec", value="h264")
-            crf=gr.Slider(0,51, value=23, step=1, label="CRF")
-            br=gr.Dropdown(["5000k","10000k","20000k"], label="Bitrate", value="10000k")
-            fmt=gr.Dropdown(["mp4","mkv","mov"], label="Format", value="mp4")
-            audio=gr.Checkbox(label="Include Audio", value=True)
-            a_codec=gr.Dropdown(["copy","aac","opus"], label="Audio Codec", value="copy")
-            a_br=gr.Dropdown(["128k","192k","256k"], label="Audio Bitrate", value="192k")
-            cuda=gr.Checkbox(label="Use CUDA Acceleration", value=torch.cuda.is_available())
-        with gr.Row():
-            start_btn=gr.Button("Process Videos 🚀", variant="primary")
-            stop_btn=gr.Button("Stop", variant="stop")
-        status=gr.Textbox(label="Status", interactive=False)
-
-        fps.change(lambda x: gr.update(visible=x=='custom'), fps, c_fps)
-        res.change(lambda x: gr.update(visible=x=='custom'), res, c_res)
-
-        start_btn.click(
-            split_videos,
-            inputs=[inp,out,dur,orig,fps,c_fps,res,c_res,vert,codec,br,fmt,audio,a_codec,a_br,crf,cuda],
-            outputs=status
+    # Check existence of ffmpeg & ffprobe
+    if not os.path.isfile(ffmpeg_bin) or not os.access(ffmpeg_bin, os.X_OK):
+        return (
+            f"Error: `ffmpeg` not found or not executable at:\n  {ffmpeg_bin}\n"
+            "Please specify the correct FFmpeg Folder, or install FFmpeg and add to PATH."
         )
-        stop_btn.click(lambda: stop_event.set() or "⚠️ Stopping...", None, status)
+    if not os.path.isfile(ffprobe_bin) or not os.access(ffprobe_bin, os.X_OK):
+        return (
+            f"Error: `ffprobe` not found or not executable at:\n  {ffprobe_bin}\n"
+            "Please specify the correct FFmpeg Folder, or install FFmpeg and add to PATH."
+        )
 
-    return demo
+    # --------------------------------------------
+    # 2) Prepare output subfolder
+    # --------------------------------------------
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = os.path.join(output_folder, f"output_{timestamp}")
+    os.makedirs(output_path, exist_ok=True)
 
-if __name__=='__main__':
-    build_ui().launch(share=True)
+    # --------------------------------------------
+    # 3) Enumerate all supported video files
+    # --------------------------------------------
+    video_files = [
+        f
+        for f in os.listdir(input_folder)
+        if f.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))
+    ]
+    if not video_files:
+        return f"No video files found in `{input_folder}`."
+
+    # --------------------------------------------
+    # 4) Process each video
+    # --------------------------------------------
+    for video_file in video_files:
+        input_path = os.path.join(input_folder, video_file)
+        base_name = os.path.splitext(video_file)[0]
+
+        # 4a) Get total duration via ffprobe
+        total_duration, err = get_duration_with_ffprobe(ffprobe_bin, input_path)
+        if err:
+            return err  # bail out on probe error
+
+        # 4b) Compute how many full chunks of size chunk_duration fit
+        num_full_chunks = int(total_duration // float(chunk_duration))
+        valid_total = num_full_chunks * float(chunk_duration)
+
+        # Skip if too short for even one chunk
+        if valid_total < float(chunk_duration):
+            continue
+
+        # 4c) For each chunk, run a separate ffmpeg invocation
+        for idx in range(num_full_chunks):
+            start_time = idx * float(chunk_duration)
+            output_clip = os.path.join(output_path, f"{base_name}_{idx:03d}.mp4")
+
+            if use_original:
+                # Copy video/audio exactly, cutting from start_time for chunk_duration
+                # "-ss" after "-i" ensures accurate frame-level cut when using -c copy
+                cmd = [
+                    ffmpeg_bin,
+                    "-hwaccel", "cuda" if torch.cuda.is_available() else "auto",
+                    "-i", input_path,
+                    "-ss", str(start_time),
+                    "-t", str(chunk_duration),
+                    "-c", "copy",
+                    "-map", "0:v",
+                    "-map", "0:a?",
+                    "-avoid_negative_ts", "1",
+                    output_clip
+                ]
+            else:
+                # Re-encode with user settings, cutting exactly from start_time
+                fps_val = float(custom_fps) if fps == "custom" else float(fps)
+
+                if resolution == "custom":
+                    try:
+                        width, height = map(int, custom_res.lower().split("x"))
+                    except:
+                        return f"Invalid resolution format: `{custom_res}`. Use WxH (e.g. 720x1280)."
+                else:
+                    width, height = map(int, resolution.split("x"))
+
+                # Select codec: use NVENC if GPU available and codec is h264/hevc
+                if torch.cuda.is_available() and codec in ["h264", "hevc"]:
+                    codec_arg = f"{codec}_nvenc"
+                else:
+                    codec_arg = codec
+
+                cmd = [
+                    ffmpeg_bin,
+                    "-hwaccel", "cuda" if torch.cuda.is_available() else "auto",
+                    "-i", input_path,
+                    "-ss", str(start_time),
+                    "-t", str(chunk_duration),
+                    "-c:v", codec_arg,
+                    "-r", str(fps_val),
+                    "-s", f"{width}x{height}",
+                    "-b:v", bitrate,
+                    "-c:a", "copy",
+                    "-map", "0:v",
+                    "-map", "0:a?",
+                    "-avoid_negative_ts", "1",
+                    output_clip
+                ]
+
+            # 4d) Run ffmpeg for this chunk
+            try:
+                subprocess.run(cmd, check=True, stderr=subprocess.PIPE, text=True)
+            except subprocess.CalledProcessError as e:
+                return (
+                    f"Error processing chunk {idx:03d} of `{video_file}`:\n"
+                    f"{e.stderr.strip()}"
+                )
+
+            # 4e) If user provided a caption, write a .txt next to each segment
+            if custom_caption and custom_caption.strip() != "":
+                txt_path = os.path.splitext(output_clip)[0] + ".txt"
+                try:
+                    with open(txt_path, "w", encoding="utf-8") as tf:
+                        tf.write(custom_caption)
+                except Exception as e:
+                    print(f"Warning: could not write caption file `{txt_path}`: {e}")
+
+    return f"✅ All done! Exactly {int(chunk_duration)}-second segments are in:\n  {output_path}"
+
+
+# ------------------- Gradio UI -------------------
+
+with gr.Blocks(title="Video Splitter Pro") as demo:
+    gr.Markdown("""# 🎥 Video Splitter Pro with GPU Acceleration  
+**Created by Eagle-42**""")
+    gr.Markdown(f"**GPU Detected:** {get_gpu_info()}")
+
+    with gr.Row():
+        input_folder = gr.Textbox(
+            label="Input Folder Path",
+            placeholder=r"C:\videos\input",
+        )
+        output_folder = gr.Textbox(
+            label="Output Folder Path",
+            placeholder=r"C:\videos\output",
+        )
+
+    chunk_duration = gr.Number(
+        label="Chunk Duration (seconds)",
+        value=1,
+    )
+
+    # FFmpeg folder (optional)
+    ffmpeg_folder = gr.Textbox(
+        label="FFmpeg Folder (optional)",
+        placeholder=r"C:\ffmpeg\bin",
+        info=(
+            "If left blank, assumes `ffmpeg` & `ffprobe` are on your PATH. "
+            "Otherwise point to the folder containing ffmpeg.exe and ffprobe.exe."
+        )
+    )
+
+    # Custom caption
+    custom_caption = gr.Textbox(
+        label="Custom Caption (optional)",
+        placeholder="Enter text to save as .txt for each clip"
+    )
+
+    with gr.Accordion("Advanced Settings", open=False):
+        use_original = gr.Checkbox(
+            label="Use Original Video Settings (no re-encode)",
+            value=True
+        )
+
+        fps = gr.Dropdown(
+            ["16", "18", "23.976", "24", "25", "29.97", "30", "50", "60", "custom"],
+            label="Frame Rate",
+            value="30",
+        )
+        custom_fps = gr.Number(
+            label="Custom FPS",
+            visible=False,
+        )
+
+        resolution = gr.Dropdown(
+            [
+                "1280x720",
+                "720x1280",
+                "1920x1080",
+                "1080x1920",
+                "3840x2160",
+                "2160x3840",
+                "2160x2160",
+                "1536x1536",
+                "1280x1280",
+                "1024x1024",
+                "720x720",
+                "custom",
+            ],
+            label="Resolution",
+            value="2160x2160",
+        )
+        custom_res = gr.Textbox(
+            label="Custom Resolution (WxH)",
+            visible=False,
+            placeholder="e.g., 720x1280",
+        )
+
+        codec = gr.Dropdown(
+            ["h264", "hevc", "vp9", "av1"],
+            label="Video Codec",
+            value="hevc",
+        )
+        bitrate = gr.Dropdown(
+            ["5000k", "10000k", "20000k", "50000k"],
+            label="Bitrate",
+            value="20000k",
+        )
+
+    submit = gr.Button("Process Videos 🚀", variant="primary")
+    output = gr.Textbox(label="Status / Errors")
+
+    # Show/hide the custom FPS field
+    fps.change(lambda x: gr.update(visible=(x == "custom")), fps, custom_fps)
+    # Show/hide the custom resolution field
+    resolution.change(lambda x: gr.update(visible=(x == "custom")), resolution, custom_res)
+
+    submit.click(
+        split_videos,
+        inputs=[
+            input_folder,
+            output_folder,
+            chunk_duration,
+            use_original,
+            fps,
+            custom_fps,
+            resolution,
+            custom_res,
+            codec,
+            bitrate,
+            custom_caption,
+            ffmpeg_folder,
+        ],
+        outputs=output,
+    )
+
+if __name__ == "__main__":
+    demo.launch()
